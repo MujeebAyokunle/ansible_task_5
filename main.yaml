@@ -1,0 +1,132 @@
+---
+- name: Configure and deploy Golang boilerplate application
+  hosts: hng
+  become: yes
+
+  vars:
+    repo_url: "https://github.com/hngprojects/hng_boilerplate_golang_web.git"
+    repo_branch: "devops"
+    app_dir: "/opt/stage_5b"
+    pg_user: "admin"
+    pg_password: "mjbp@$$w0rd"
+    pg_password_file: "/var/secrets/pg_pw.txt"
+    log_dir: "/var/log/stage_5b"
+    app_port: 3000
+    proxy_port: 80
+
+  tasks:
+    - name: Ensure required directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: hng
+        group: hng
+        mode: '0755'
+      loop:
+        - "{{ app_dir }}"
+        - "{{ log_dir }}"
+        - "/var/secrets"
+
+    - name: Create hng user with sudo privileges
+      user:
+        name: hng
+        shell: /bin/bash
+        groups: sudo
+        state: present
+
+    - name: Clone the repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ repo_branch }}"
+        force: yes
+      become_user: hng
+
+    - name: Install necessary packages
+      apt:
+        name:
+          - git
+          - nginx
+          - postgresql
+          - postgresql-contrib
+          - golang
+          - python3-psycopg2
+          - libpq-dev
+        state: present
+        update_cache: yes
+
+    - name: Save PostgreSQL credentials
+      copy:
+        content: "user: {{ pg_user }}\npassword: {{ pg_password }}"
+        dest: "{{ pg_password_file }}"
+        owner: hng
+        group: hng
+        mode: '0600'
+
+    - name: Ensure PostgreSQL service is running
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Configure PostgreSQL database
+      postgresql_db:
+        name: "{{ pg_user }}"
+        state: present
+
+    - name: Ensure PostgreSQL user is present
+      postgresql_user:
+        name: "{{ pg_user }}"
+        password: "{{ pg_password }}"
+        state: present
+
+    - name: Build and deploy the Golang application
+      shell: |
+        cd {{ app_dir }}
+        go mod tidy
+        go build -o app .
+        nohup ./app > {{ log_dir }}/out.log 2> {{ log_dir }}/error.log &
+      become_user: hng
+
+    - name: Ensure application is running on the specified port
+      wait_for:
+        port: "{{ app_port }}"
+        state: started
+        delay: 5
+        timeout: 30
+
+    - name: Configure Nginx
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name localhost;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+              }
+
+              error_log {{ log_dir }}/error.log;
+              access_log {{ log_dir }}/out.log;
+          }
+        dest: /etc/nginx/sites-available/default
+      notify:
+        - Restart nginx
+
+    - name: Ensure logs directory ownership
+      file:
+        path: "{{ log_dir }}"
+        owner: hng
+        group: hng
+        recurse: yes
+
+  handlers:
+    - name: Restart nginx
+      service:
+        name: nginx
+        state: restarted
